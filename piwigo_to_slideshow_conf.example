@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────────────────
+# piwigo_to_slideshow.conf
+#
+# Configuration for Piwigo → SlideShow sync script.
+# Place this file next to piwigo_to_slideshow.py
+# or specify its path with --config /path/to/file.conf
+#
+# Values can also be overridden by environment variables
+# (PIWIGO_URL, SLIDESHOW_URL, …) or CLI arguments.
+# Priority: CLI args > env vars > config file > defaults
+# ─────────────────────────────────────────────────────────
+
+[piwigo]
+url      = https://piwigo.local.com
+user     = PIWIGO_USERNAME
+password = PIWIGO_PASSWORD
+# Comma-separated tag names to filter photos
+# Examples: "Cadre-photo" or "Cadre-photo,Volley,Family"
+# Leave empty to sync ALL photos
+tags     =
+# Piwigo 16+ API key (alternative to user/password login)
+# Generate one in your Piwigo profile → API Keys section
+# Format: pkid-XXXXXXXX-XXXXXXXXXXXX:YYYYYY...
+# Leave empty to use user/password login instead
+api_key  = pkid-XXXXXXXXXXXXXXXXXXXXXXX:YYYYYYYYYYYY
+
+[slideshow]
+url      = http://SLIDESHOW_IP:8080
+user     = WEBDAV_USER
+password = WEBDAV_PASSWORD
+# Subfolder on the SlideShow device (keeps Piwigo photos separate)
+folder   = piwigo
+
+[options]
+# Piwigo API pagination size
+per_page = 500

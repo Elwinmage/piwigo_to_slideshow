@@ -4,10 +4,10 @@ Sync photos from a [Piwigo](https://piwigo.org/) gallery to a [SlideShow Digital
 
 ## How it works
 
-The script fetches all Piwigo photos carrying a given tag (default: `Cadre-photo`) and performs a **true two-way sync** with the SlideShow device:
+The script fetches photos from Piwigo — filtered by one or more tags, or the entire gallery — and performs a **true two-way sync** with the SlideShow device:
 
 - **Uploads** photos that exist in Piwigo but are missing from the SlideShow
-- **Deletes** photos on the SlideShow that no longer carry the tag in Piwigo
+- **Deletes** photos on the SlideShow that no longer match the Piwigo selection
 - **Skips** photos already present on both sides
 
 The Piwigo album hierarchy is mirrored on the SlideShow:
@@ -55,7 +55,10 @@ The `.conf` file uses the INI format:
 url      = https://my-piwigo.example.com
 user     = admin
 password = secret
-tag      = Cadre-photo
+# Comma-separated tag names to filter photos
+# Examples: "Cadre-photo" or "Cadre-photo,Volley,Family"
+# Leave empty to sync ALL photos
+tags     = Cadre-photo
 # Piwigo 16+: API key (alternative to user/password)
 # Generate one in your Piwigo profile → API Keys
 api_key  =
@@ -72,12 +75,24 @@ folder   = piwigo
 per_page = 500
 ```
 
+### Tag filtering
+
+The `tags` setting controls which photos are synced:
+
+| `tags` value | Behavior |
+|---|---|
+| *(empty)* | Sync **all** photos from Piwigo |
+| `Cadre-photo` | Sync only photos tagged `Cadre-photo` |
+| `Cadre-photo,Volley` | Sync photos tagged `Cadre-photo` **or** `Volley` (union, deduplicated) |
+
+Tags can also be set via CLI (`--piwigo-tags`) or environment variable (`PIWIGO_TAGS`).
+
 ### Configuration priority
 
 Settings are resolved in this order (first match wins):
 
-1. CLI arguments (`--piwigo-url`, `--slideshow-user`, etc.)
-2. Environment variables (`PIWIGO_URL`, `SLIDESHOW_URL`, etc.)
+1. CLI arguments (`--piwigo-url`, `--piwigo-tags`, etc.)
+2. Environment variables (`PIWIGO_URL`, `PIWIGO_TAGS`, etc.)
 3. Config file
 4. Built-in defaults
 
@@ -105,8 +120,14 @@ When `api_key` is set, `user` and `password` are ignored.
 ### Sync
 
 ```bash
-# Full sync (upload missing + delete orphans)
+# Full sync using tags from config file
 python piwigo_to_slideshow.py
+
+# Override tags from CLI
+python piwigo_to_slideshow.py --piwigo-tags "Cadre-photo,Volley"
+
+# Sync ALL photos (no tag filter)
+python piwigo_to_slideshow.py --piwigo-tags ""
 
 # Dry run — simulate without modifying anything
 python piwigo_to_slideshow.py --dry-run
@@ -123,8 +144,14 @@ The script is **idempotent**: running it twice in a row, the second run does not
 # Files currently on the SlideShow
 python piwigo_to_slideshow.py --list
 
-# Tagged photos on Piwigo
+# Photos matching configured tags on Piwigo
 python piwigo_to_slideshow.py --list-piwigo
+
+# List with specific tags
+python piwigo_to_slideshow.py --list-piwigo --piwigo-tags "Volley"
+
+# List ALL Piwigo photos
+python piwigo_to_slideshow.py --list-piwigo --piwigo-tags ""
 
 # Show only the first 20 entries
 python piwigo_to_slideshow.py --list --limit 20
@@ -155,7 +182,7 @@ python piwigo_to_slideshow.py --wipe --yes
 ```
 usage: piwigo_to_slideshow.py [-h] [--config FILE]
                               [--piwigo-url URL] [--piwigo-user USER]
-                              [--piwigo-pass PASS] [--piwigo-tag TAG]
+                              [--piwigo-pass PASS] [--piwigo-tags TAGS]
                               [--piwigo-api-key KEY]
                               [--slideshow-url URL] [--slideshow-user USER]
                               [--slideshow-pass PASS] [--slideshow-folder DIR]
@@ -165,9 +192,10 @@ usage: piwigo_to_slideshow.py [-h] [--config FILE]
 
 Options:
   --config, -c FILE      Path to .conf file (default: auto-detected)
+  --piwigo-tags TAGS     Comma-separated tags (empty = all photos)
   --dry-run              Simulate without uploading/deleting anything
   --list                 List files on the SlideShow device and exit
-  --list-piwigo          List tagged photos on Piwigo and exit
+  --list-piwigo          List matching photos on Piwigo and exit
   --limit N              Limit list output to N entries (0 = all)
   --wipe                 Delete ALL files/folders from the SlideShow target
   --yes, -y              Skip confirmation prompt for --wipe
@@ -184,7 +212,7 @@ All settings can be overridden via environment variables:
 | `PIWIGO_URL` | Piwigo base URL |
 | `PIWIGO_USER` | Piwigo username |
 | `PIWIGO_PASS` | Piwigo password |
-| `PIWIGO_TAG` | Tag to filter photos |
+| `PIWIGO_TAGS` | Comma-separated tags to filter (empty = all) |
 | `PIWIGO_API_KEY` | Piwigo 16+ API key |
 | `SLIDESHOW_URL` | SlideShow base URL |
 | `SLIDESHOW_USER` | SlideShow / WebDAV username |
@@ -194,12 +222,12 @@ All settings can be overridden via environment variables:
 
 ## How the sync works
 
-1. **Fetch** all images tagged with the configured tag from Piwigo (`pwg.tags.getImages`)
+1. **Fetch** images from Piwigo — by tag(s) via `pwg.tags.getImages`, or all via `pwg.categories.getImages`. Multiple tags are fetched individually and deduplicated by image ID
 2. **Extract** the album path from each image's `element_url` (e.g. `.../galleries/Holidays/Summer/photo.jpg` → `Holidays/Summer`)
 3. **List** all files currently on the SlideShow via WebDAV `PROPFIND`
 4. **Compare** the two sets by relative path
 5. **Upload** missing files (download from Piwigo, PUT to SlideShow WebDAV)
-6. **Delete** orphan files (on SlideShow but no longer tagged in Piwigo)
+6. **Delete** orphan files (on SlideShow but no longer in the Piwigo selection)
 7. **Create** subdirectories automatically via WebDAV `MKCOL`
 
 ## Compatibility
@@ -214,6 +242,7 @@ All settings can be overridden via environment variables:
 - In SlideShow, create a **Content** of type "Files randomly" with path `piwigo/**` to display all synced photos including subfolders.
 - The `per_page` setting controls how many images are fetched per API call. With large libraries (10,000+ photos), `500` is a good balance between speed and reliability.
 - If the SlideShow device resets connections during bulk uploads, increase the delay in the script (`time.sleep(0.3)` → `time.sleep(1.0)`).
+- When using multiple tags, images appearing in several tags are only synced once (deduplicated by Piwigo image ID).
 
 ## License
 

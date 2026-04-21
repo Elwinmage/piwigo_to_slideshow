@@ -41,7 +41,7 @@ DEFAULTS = {
     "piwigo_url": "https://your-piwigo.example.com",
     "piwigo_user": "admin",
     "piwigo_pass": "admin",
-    "piwigo_tag": "Cadre-photo",
+    "piwigo_tags": "",     # comma-separated list of tags, empty = all photos
     "piwigo_api_key": "",  # Piwigo 16+ API key (alternative to user/pass)
 
     "slideshow_url": "http://192.168.1.100:8080",
@@ -91,7 +91,8 @@ def load_config(config_path: str | None = None) -> dict:
             ("piwigo", "url"):      "piwigo_url",
             ("piwigo", "user"):     "piwigo_user",
             ("piwigo", "password"): "piwigo_pass",
-            ("piwigo", "tag"):      "piwigo_tag",
+            ("piwigo", "tags"):     "piwigo_tags",
+            ("piwigo", "tag"):      "piwigo_tags",   # backward compat
             ("piwigo", "api_key"):  "piwigo_api_key",
             ("slideshow", "url"):      "slideshow_url",
             ("slideshow", "user"):     "slideshow_user",
@@ -221,7 +222,7 @@ class PiwigoClient:
         raise ValueError(f"Tag '{tag_name}' not found on Piwigo server")
 
     def get_images_by_tag(self, tag_id: int, per_page: int = 500) -> list[dict]:
-        """Récupère TOUTES les images pour un tag donné sans limite de pagination."""
+        """Fetch all images for a single tag (handles pagination)."""
         images = []
         page = 0
         
@@ -235,20 +236,63 @@ class PiwigoClient:
             )
             
             page_images = result.get("images", [])
-            
-            # Si la page est vide, on a fini
             if not page_images:
                 break
-                
             images.extend(page_images)
-            
-            # Si on a reçu moins d'images que la taille de la page, c'est la dernière page
             if len(page_images) < per_page:
                 break
-            
             page += 1
             
         log.info("Found %d images total with tag ID %d", len(images), tag_id)
+        return images
+
+    def get_images_by_tags(self, tag_names: list[str], per_page: int = 500) -> list[dict]:
+        """
+        Fetch images matching any of the given tags.
+        Deduplicates by image ID across tags.
+        """
+        seen_ids: set[int] = set()
+        all_images: list[dict] = []
+
+        for tag_name in tag_names:
+            tag_name = tag_name.strip()
+            if not tag_name:
+                continue
+            tag_id = self.get_tag_id(tag_name)
+            images = self.get_images_by_tag(tag_id, per_page=per_page)
+            for img in images:
+                img_id = int(img["id"])
+                if img_id not in seen_ids:
+                    seen_ids.add(img_id)
+                    all_images.append(img)
+
+        log.info("Found %d unique images across %d tag(s)", len(all_images), len(tag_names))
+        return all_images
+
+    def get_all_images(self, per_page: int = 500) -> list[dict]:
+        """Fetch ALL images from Piwigo (no tag filter), handles pagination."""
+        images = []
+        page = 0
+
+        while True:
+            log.info("Fetching all Piwigo images (page %d, collected: %d)...", page, len(images))
+            result = self._call(
+                "pwg.categories.getImages",
+                cat_id=0,
+                recursive="true",
+                per_page=per_page,
+                page=page,
+            )
+
+            page_images = result.get("images", [])
+            if not page_images:
+                break
+            images.extend(page_images)
+            if len(page_images) < per_page:
+                break
+            page += 1
+
+        log.info("Found %d images total (all photos)", len(images))
         return images
 
     
@@ -532,6 +576,34 @@ def make_rel_path(image: dict, album_path: str) -> str:
     return filename
 
 
+def parse_tags(tags_str: str) -> list[str]:
+    """
+    Parse a tags string into a list of tag names.
+    Supports comma-separated values. Returns empty list if blank.
+    """
+    if not tags_str or not tags_str.strip():
+        return []
+    return [t.strip() for t in tags_str.split(",") if t.strip()]
+
+
+def fetch_images(piwigo: PiwigoClient, tags: list[str],
+                 per_page: int) -> list[dict]:
+    """
+    Fetch images from Piwigo based on tags configuration.
+    - Empty tags list → all images
+    - Single tag → images with that tag
+    - Multiple tags → images with any of those tags (deduplicated)
+    """
+    if not tags:
+        log.info("No tags specified — fetching ALL images from Piwigo")
+        return piwigo.get_all_images(per_page=per_page)
+    elif len(tags) == 1:
+        tag_id = piwigo.get_tag_id(tags[0])
+        return piwigo.get_images_by_tag(tag_id, per_page=per_page)
+    else:
+        return piwigo.get_images_by_tags(tags, per_page=per_page)
+
+
 # ---------------------------------------------------------------------------
 # Listing commands
 # ---------------------------------------------------------------------------
@@ -570,14 +642,15 @@ def list_slideshow(args):
 
 
 def list_piwigo(args):
-    """List photos tagged on Piwigo."""
+    """List photos on Piwigo (filtered by tags or all)."""
     piwigo = PiwigoClient(args.piwigo_url, args.piwigo_user, args.piwigo_pass,
                           api_key=args.piwigo_api_key)
-    tag_id = piwigo.get_tag_id(args.piwigo_tag)
-    images = piwigo.get_images_by_tag(tag_id, per_page=args.per_page)
+    tags = parse_tags(args.piwigo_tags)
+    images = fetch_images(piwigo, tags, per_page=args.per_page)
 
     if not images:
-        print(f"No images found with tag '{args.piwigo_tag}'.")
+        label = ", ".join(tags) if tags else "all photos"
+        print(f"No images found ({label}).")
         return
 
     print(f"\n{'#':>6}  {'ID':>7}  {'Album/File':<60} {'Size':>12}  {'Date'}")
@@ -595,7 +668,8 @@ def list_piwigo(args):
     if args.limit and len(images) > args.limit:
         print(f"         ... and {len(images) - args.limit} more photos")
     print("─" * 110)
-    print(f"       {len(images)} photo(s) with tag '{args.piwigo_tag}'\n")
+    label = f"tag(s): {', '.join(tags)}" if tags else "all photos"
+    print(f"       {len(images)} photo(s) — {label}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -605,11 +679,12 @@ def sync(args):
     # --- Connect to Piwigo ---
     piwigo = PiwigoClient(args.piwigo_url, args.piwigo_user, args.piwigo_pass,
                           api_key=args.piwigo_api_key)
-    tag_id = piwigo.get_tag_id(args.piwigo_tag)
-    images = piwigo.get_images_by_tag(tag_id, per_page=args.per_page)
+    tags = parse_tags(args.piwigo_tags)
+    images = fetch_images(piwigo, tags, per_page=args.per_page)
 
     if not images:
-        log.warning("No images found with tag '%s'. Nothing to sync.", args.piwigo_tag)
+        label = ", ".join(tags) if tags else "all photos"
+        log.warning("No images found (%s). Nothing to sync.", label)
         return
 
     # --- Connect to SlideShow ---
@@ -684,8 +759,8 @@ def sync(args):
     # --- Remove orphan files (no longer tagged in Piwigo) ---
     removed = 0
     if to_remove:
-        log.info("Removing %d files no longer tagged '%s'...",
-                 len(to_remove), args.piwigo_tag)
+        log.info("Removing %d files no longer matching Piwigo selection...",
+                 len(to_remove))
         for rel_path in sorted(to_remove):
             if args.dry_run:
                 log.info("  [DRY RUN] Would delete %s", rel_path)
@@ -731,9 +806,11 @@ def parse_args():
     g.add_argument("--piwigo-pass",
                     default=os.getenv("PIWIGO_PASS", cfg["piwigo_pass"]),
                     help="Piwigo password")
-    g.add_argument("--piwigo-tag",
-                    default=os.getenv("PIWIGO_TAG", cfg["piwigo_tag"]),
-                    help="Tag name to filter photos (default: Cadre-photo)")
+    g.add_argument("--piwigo-tags",
+                    default=os.getenv("PIWIGO_TAGS", cfg["piwigo_tags"]),
+                    help="Comma-separated tag names to filter photos "
+                         "(e.g. 'Cadre-photo' or 'Cadre-photo,Volley'). "
+                         "Empty = sync all photos")
     g.add_argument("--piwigo-api-key",
                     default=os.getenv("PIWIGO_API_KEY", cfg["piwigo_api_key"]),
                     help="Piwigo 16+ API key (alternative to user/password)")
@@ -799,7 +876,9 @@ def main():
 
         # --- Sync mode ---
         log.info("=== Piwigo → SlideShow sync ===")
-        log.info("Piwigo:    %s  (tag: %s)", args.piwigo_url, args.piwigo_tag)
+        tags = parse_tags(args.piwigo_tags)
+        tag_label = ", ".join(tags) if tags else "(all photos)"
+        log.info("Piwigo:    %s  (tags: %s)", args.piwigo_url, tag_label)
         log.info("SlideShow: %s  (folder: %s)",
                  args.slideshow_url, args.slideshow_folder or "/")
         sync(args)
