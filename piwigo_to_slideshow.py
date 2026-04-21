@@ -410,11 +410,75 @@ class SlideshowWebDAV:
 
     def list_files_detailed(self) -> list[dict]:
         """
-        Recursively list files with metadata via PROPFIND Depth: infinity.
+        Recursively list files with metadata via PROPFIND Depth: 1.
+        Walks subdirectories one by one since SlideShow's WebDAV
+        does not reliably support Depth: infinity.
         Returns dicts with 'name', 'path' (relative), 'size', 'modified'.
         """
-        url = f"{self._target_url}/"
-        headers = {"Depth": "infinity", "Content-Type": "application/xml"}
+        base_prefix = "/webdav/"
+        if self.folder:
+            base_prefix = f"/webdav/{self.folder}/"
+
+        all_files: list[dict] = []
+        # Queue of WebDAV URLs to explore
+        dirs_to_visit = [f"{self._target_url}/"]
+
+        while dirs_to_visit:
+            url = dirs_to_visit.pop(0)
+            entries = self._propfind_depth1(url)
+
+            for entry in entries:
+                href = entry["href"]
+                decoded = unquote(href).rstrip("/")
+
+                # Normalize: collapse double slashes and clean up
+                while "//" in decoded:
+                    decoded = decoded.replace("//", "/")
+
+                # Build relative path
+                idx = decoded.find(base_prefix)
+                if idx >= 0:
+                    rel_path = decoded[idx + len(base_prefix):].lstrip("/")
+                else:
+                    rel_path = decoded.split("/")[-1].lstrip("/")
+
+                # Clean up any remaining double slashes in rel_path
+                while "//" in rel_path:
+                    rel_path = rel_path.replace("//", "/")
+
+                if not rel_path:
+                    continue
+
+                if entry["is_collection"]:
+                    # Queue this subdirectory for exploration
+                    decoded_path = unquote(entry["href"]).rstrip("/")
+                    # Normalize the URL too
+                    clean_path = decoded_path
+                    while "//" in clean_path:
+                        clean_path = clean_path.replace("//", "/")
+                    # Reconstruct with single slash after host:port
+                    subdir_url = f"{self.base_url}{clean_path}/"
+                    dirs_to_visit.append(subdir_url)
+                else:
+                    name = rel_path.split("/")[-1]
+                    all_files.append({
+                        "name": name,
+                        "path": rel_path,
+                        "size": entry.get("size", 0),
+                        "modified": entry.get("modified", ""),
+                        "content_type": entry.get("content_type", ""),
+                    })
+
+        log.info("WebDAV listing: %d files found", len(all_files))
+        return sorted(all_files, key=lambda f: f["path"])
+
+    def _propfind_depth1(self, url: str) -> list[dict]:
+        """
+        PROPFIND with Depth: 1 on a single directory.
+        Returns a list of entries (files and subdirectories),
+        excluding the directory itself.
+        """
+        headers = {"Depth": "1", "Content-Type": "application/xml"}
         body = (
             '<?xml version="1.0"?>'
             '<d:propfind xmlns:d="DAV:">'
@@ -427,65 +491,56 @@ class SlideshowWebDAV:
             "</d:prop>"
             "</d:propfind>"
         )
-        resp = requests.request("PROPFIND", url, auth=self.auth,
-                                headers=headers, data=body)
-
-        # Some WebDAV servers reject Depth: infinity, fall back to Depth: 1
-        if resp.status_code == 403:
-            log.debug("Depth: infinity rejected, falling back to Depth: 1")
-            headers["Depth"] = "1"
+        try:
             resp = requests.request("PROPFIND", url, auth=self.auth,
                                     headers=headers, data=body)
-
-        if resp.status_code not in (200, 207):
-            log.warning("PROPFIND failed: %d %s", resp.status_code,
-                        resp.text[:200] if resp.text else "(empty)")
+        except requests.exceptions.ConnectionError as e:
+            log.warning("PROPFIND connection error on %s: %s", url, e)
             return []
 
-        # Determine the base prefix to strip for relative paths
-        base_prefix = unquote(f"/webdav/")
-        if self.folder:
-            base_prefix = unquote(f"/webdav/{self.folder}/")
-            
-        files = []
+        if resp.status_code not in (200, 207):
+            log.warning("PROPFIND %s failed: %d", url, resp.status_code)
+            return []
+
+        entries = []
         try:
             root = ET.fromstring(resp.content)
             ns = {"d": "DAV:"}
-            for response in root.findall(".//d:response", ns):
-                # Skip collections (directories)
-                restype = response.find(".//d:propstat/d:prop/d:resourcetype", ns)
-                if restype is not None and restype.find("d:collection", ns) is not None:
-                    continue
+            responses = root.findall(".//d:response", ns)
 
+            # The first response is the directory itself — skip it
+            for i, response in enumerate(responses):
                 href = response.findtext("d:href", "", ns)
-                decoded = unquote(href).rstrip("/")
 
-                # Build relative path by stripping the base prefix
-                idx = decoded.find(base_prefix)
-                if idx >= 0:
-                    rel_path = decoded[idx + len(base_prefix):].lstrip("/")
-                else:
-                    rel_path = decoded.split("/")[-1].lstrip("/")
+                # Detect if this is a collection (directory)
+                restype = response.find(".//d:propstat/d:prop/d:resourcetype", ns)
+                is_collection = (
+                    restype is not None
+                    and restype.find("d:collection", ns) is not None
+                )
 
-                if not rel_path:
+                # Skip the directory itself (first entry, or matching the request URL)
+                decoded_href = unquote(href).rstrip("/")
+                decoded_url = unquote(url).rstrip("/")
+                if decoded_href == decoded_url or i == 0 and is_collection:
                     continue
 
-                name = rel_path.split("/")[-1]
                 props = response.find(".//d:propstat/d:prop", ns)
                 size_str = props.findtext("d:getcontentlength", "", ns) if props is not None else ""
                 modified = props.findtext("d:getlastmodified", "", ns) if props is not None else ""
                 ctype = props.findtext("d:getcontenttype", "", ns) if props is not None else ""
-                files.append({
-                    "name": name,
-                    "path": rel_path,
+
+                entries.append({
+                    "href": href,
+                    "is_collection": is_collection,
                     "size": int(size_str) if size_str.isdigit() else 0,
                     "modified": modified,
                     "content_type": ctype,
                 })
         except ET.ParseError as e:
-            log.warning("Could not parse PROPFIND response: %s", e)
-        log.info("WebDAV listing: %d files found", len(files))
-        return sorted(files, key=lambda f: f["path"])
+            log.warning("Could not parse PROPFIND response for %s: %s", url, e)
+
+        return entries
 
     def upload(self, rel_path: str, data: bytes) -> bool:
         """
